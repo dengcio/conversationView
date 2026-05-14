@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 对话历史查看器</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>🤖 AI 对话历史查看器</h1>
+            <div class="search-box">
+                <input type="text" id="search-input" placeholder="搜索对话内容..." />
+                <button onclick="searchConversations()">搜索</button>
+            </div>
+        </header>
+
+        <main>
+            <div class="sidebar">
+                <h2>对话会话</h2>
+                <div id="session-list"></div>
+            </div>
+
+            <div class="content">
+                <div id="conversation-view">
+                    <p class="placeholder">选择一个会话查看对话内容</p>
+                </div>
+
+                <div id="chunk-panel" style="display: none;">
+                    <h3>保存的分块</h3>
+                    <div id="chunk-list"></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
