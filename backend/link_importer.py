@@ -647,6 +647,241 @@ def _extract_deepseek(html: str) -> Optional[dict]:
     return None
 
 
+def _is_valid_conversation_result(result: dict) -> bool:
+    """Check if extracted result looks like real conversation, not JS artifacts."""
+    if not result or not result.get("raw_text"):
+        return False
+    raw = result["raw_text"]
+    # Must have at least some actual content
+    if len(raw) < 100:
+        return False
+    # Check that formatted messages look like conversation
+    msgs = raw.split("\n\n")
+    real_msgs = 0
+    for msg in msgs:
+        if not msg.strip():
+            continue
+        # Skip metadata-looking messages
+        if re.search(r'\.js\b|\.css\b|googleapis\.|gci_|\.push\(|function\s*\(', msg):
+            continue
+        # Must have a role label and some content
+        if re.match(r'(User|Gemini|Assistant|Model):\s*\S', msg):
+            content_part = msg.split(':', 1)[1].strip() if ':' in msg else ''
+            if len(content_part) > 20:
+                real_msgs += 1
+    print(f"[link_importer]   Validation: {len(msgs)} formatted msgs, {real_msgs} real-looking")
+    return real_msgs >= 2
+
+
+def _extract_gemini_visible_text(html: str) -> Optional[dict]:
+    """Extract conversation from Gemini share page by parsing visible text.
+
+    Gemini renders conversation as visible text in the HTML (SSR).
+    This extracts natural-language text segments and assembles them as messages.
+    """
+    # Remove script and style content
+    clean = re.sub(r'<script[^>]*>[\s\S]*?</script>', '', html, flags=re.IGNORECASE)
+    clean = re.sub(r'<style[^>]*>[\s\S]*?</style>', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'<noscript[^>]*>[\s\S]*?</noscript>', '', clean, flags=re.IGNORECASE)
+    # Remove HTML comments
+    clean = re.sub(r'<!--[\s\S]*?-->', '', clean)
+
+    # Strip remaining HTML tags — use space not newline to keep text flowing
+    text = re.sub(r'<[^>]+>', ' ', clean)
+
+    # Decode common HTML entities
+    import html as _html
+    text = _html.unescape(text)
+
+    # Normalize whitespace: collapse spaces, keep paragraph breaks
+    text = re.sub(r'[ \t\r]+', ' ', text)
+    text = re.sub(r'\n{2,}', '\n\n', text)
+    text = re.sub(r' \n', '\n', text)
+    text = re.sub(r'\n ', '\n', text)
+
+    # Apply unicode unescape to the entire text first
+    text = _unescape_content(text)
+
+    # Find natural language segments DIRECTLY from HTML before stripping tags.
+    # HTML tags act as natural boundaries between messages — the character class
+    # excludes tag characters like < > / so segments auto-split at tag boundaries.
+    raw_segments = re.findall(r'[\w\s一-鿿.,!?;:()\[\]{}\"\'\-_@#$%^&*+=]{80,}', clean)
+    print(f"[link_importer]   Raw segments from HTML: {len(raw_segments)}")
+
+    # Now strip any remaining inline tags from each segment
+    segments = []
+    for seg in raw_segments:
+        seg = re.sub(r'<[^>]+>', ' ', seg)
+        seg = re.sub(r'\s+', ' ', seg).strip()
+        if seg:
+            segments.append(seg)
+
+    # Fallback: if regex approach yields too few, try newline-based splitting
+    if len(segments) < 3:
+        blocks = [b.strip() for b in text.split('\n\n') if b.strip()]
+        segments = []
+        for block in blocks:
+            lines = [l.strip() for l in block.split('\n') if l.strip()]
+            for line in lines:
+                if len(line) >= 30:
+                    segments.append(line)
+
+    print(f"[link_importer]   Raw segments before filter: {len(raw_segments)}")
+
+    # Filter: must be natural language, not UI boilerplate, reasonable length
+    segments = []
+    for seg in raw_segments:
+        seg = seg.strip()
+        if len(seg) < 30:
+            continue
+        if len(seg) > 10000:  # Too long = probably concatenated
+            continue
+        if _is_gemini_ui_boilerplate(seg):
+            continue
+        # Must have spaces (natural language), not just one long token
+        if ' ' not in seg and '\n' not in seg:
+            continue
+        segments.append(seg)
+
+    print(f"[link_importer]   After filter: {len(segments)} segments")
+
+    if not segments:
+        return None
+
+    # Deduplicate: remove shorter substrings contained in longer ones
+    deduped = []
+    for s in segments:
+        is_sub = False
+        for other in segments:
+            if s != other and s in other and len(s) < len(other):
+                is_sub = True
+                break
+        if not is_sub:
+            deduped.append(s)
+
+    print(f"[link_importer]   After dedup: {len(deduped)} segments")
+
+    # Build messages with alternating roles (Gemini always starts with user)
+    messages = []
+    for i, content in enumerate(deduped):
+        role = "user" if i % 2 == 0 else "assistant"
+        messages.append((role, content))
+
+    if not messages:
+        return None
+
+    print(f"[link_importer]   Visible text messages: {len(messages)}")
+    for i, (r, c) in enumerate(messages[:6]):
+        print(f"[link_importer]     [{i}] {r}: {c[:150]}...")
+
+    raw_text = _format_messages(messages, "gemini")
+    return {"title": "", "raw_text": raw_text}
+
+
+def _is_gemini_ui_boilerplate(text: str) -> bool:
+    """Check if text looks like Gemini UI boilerplate, not conversation content."""
+    boilerplate_patterns = [
+        r'^©\s*\d{4}',  # Copyright
+        r'^Privacy(\s|$)',  # Privacy link
+        r'^Terms(\s|$)',  # Terms link
+        r'^Gemini(\s|$)',  # Just "Gemini" label
+        r'^Google(\s|$)',  # Just "Google" label
+        r'^Sign\sin',  # Sign in
+        r'^Help(\s|$)',  # Help link
+        r'^Send\sfeedback',  # Feedback link
+        r'^Report\sabuse',  # Report abuse
+        r'^Dark\stheme',  # Theme toggle
+        r'^Light\stheme',  # Theme toggle
+        r'^Settings(\s|$)',  # Settings
+        r'^Navigation',  # Navigation
+        r'^Menu(\s|$)',  # Menu
+        r'^Search(\s|$)',  # Search
+        r'^Skip\sto',  # Skip to content
+        r'^More(\s|$)',  # More button
+        r'^Share(\s|$)',  # Share button
+        r'^Export(\s|$)',  # Export button
+        r'^Delete(\s|$)',  # Delete button
+        r'^Copy(\s|$)',  # Copy button
+        r'^Edit(\s|$)',  # Edit button
+        r'^New\s(chat|conversation)',  # New chat
+        r'^Chat\s\d+',  # Chat 1, Chat 2
+        r'^Today(\s|$)',  # Date label
+        r'^Yesterday(\s|$)',  # Date label
+        r'^Previous\s\d+\sdays',  # Date range
+        r'^\d+:\d+\s*(AM|PM)?$',  # Time label
+        r'^Loading',  # Loading indicator
+        r'^Error(\s|$)',  # Error
+        r'^Retry(\s|$)',  # Retry
+        r'^Cancel(\s|$)',  # Cancel
+        r'^Submit(\s|$)',  # Submit
+        r'^Enter\sa\sprompt',  # Input placeholder
+        r'^Type\ssomething',  # Input placeholder
+        r'^Ask\sGemini',  # Input placeholder
+        r'^You\shave\sreached',  # Limit warning
+        r'^Please\stry\sagain',  # Error message
+        r'^Something\swent\swrong',  # Error message
+        r'^\(function',  # JS code leaked
+        r'^var\s',  # JS code leaked
+        r'^function\s',  # JS code leaked
+        r'^use\sstrict',  # JS code leaked
+        r'\.js\s*$',  # JS filename
+        r'googleapis\.',  # Google API reference
+        r'gci_',  # Google component ID
+    ]
+    for pat in boilerplate_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            return True
+    # High ratio of numbers/symbols
+    alpha_ratio = sum(1 for c in text if c.isalpha() or c.isspace()) / max(len(text), 1)
+    if alpha_ratio < 0.5:
+        return True
+    return False
+
+
+def _try_extract_json_from_text(text: str) -> Optional[dict]:
+    """Try to find and extract conversation data from text containing JSON fragments."""
+    # Find all JSON array starts
+    best_result = None
+    for bracket_m in re.finditer(r'\[', text):
+        depth = 0
+        start = bracket_m.start()
+        end = start
+        for i in range(start, min(start + 1000000, len(text))):
+            if text[i] == '[':
+                depth += 1
+            elif text[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end <= start:
+            continue
+        json_str = text[start:end]
+        if len(json_str) < 200:
+            continue
+        # Clean up JS quirks
+        for attempt in range(2):
+            try:
+                data = json.loads(json_str)
+                # Check if this looks like conversation data
+                if isinstance(data, list) and len(data) > 0:
+                    result = _extract_from_gemini_data(data)
+                    if result:
+                        print(f"[DEBUG-gemini]   try_extract: raw_text preview: {result['raw_text'][:200]}...")
+                        if _is_valid_conversation_result(result):
+                            return result
+                        elif best_result is None:
+                            best_result = result  # keep as fallback
+                break
+            except json.JSONDecodeError:
+                if attempt == 0:
+                    cleaned = re.sub(r'/\*[\s\S]*?\*/', '', json_str)
+                    cleaned = re.sub(r'//[^\n]*', '', cleaned)
+                    cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+                    json_str = cleaned
+    return None
+
+
 def _extract_gemini(html: str) -> Optional[dict]:
     """Extract conversation from Gemini share page HTML.
 
@@ -657,17 +892,67 @@ def _extract_gemini(html: str) -> Optional[dict]:
     # Format: AF_initDataCallback({key: 'ds:0', data: [...]});
     #         AF_initDataCallback({key: 'ds:0', data: function() { return [...] }});
 
-    # Step 1: Find all AF_initDataCallback blocks
-    cb_starts = [(m.start(), m.end()) for m in re.finditer(r'AF_initDataCallback\s*\(\s*\{', html)]
-    print(f"[link_importer]   Gemini: found {len(cb_starts)} AF_initDataCallback blocks")
+    # DEBUG: Show context around AF_initDataCallback occurrences
+    for m in re.finditer(r'AF_initDataCallback', html):
+        ctx = html[max(0, m.start()-50):m.end()+200]
+        print(f"[DEBUG-gemini] AF_initDataCallback at {m.start()}: ...{ctx[:300]}...")
 
-    for block_start, data_start in cb_starts:
+    # DEBUG: Search for data injection patterns
+    for pat in [r'AF_initDataChunkQueue\.push', r'AF_initDataCallback\s*\(', r'window\.__DATA__', r'window\.__INITIAL_STATE__']:
+        matches = list(re.finditer(pat, html))
+        if matches:
+            for m in matches[:3]:
+                ctx = html[max(0, m.start()-30):m.end()+300]
+                print(f"[DEBUG-gemini] Pattern '{pat}' at {m.start()}: ...{ctx[:400]}...")
+        else:
+            print(f"[DEBUG-gemini] Pattern '{pat}': NOT FOUND")
+
+    # DEBUG: Show visible text content (strip HTML tags)
+    visible_text = re.sub(r'<[^>]+>', ' ', html)
+    visible_text = re.sub(r'\s+', ' ', visible_text).strip()
+    # Find long natural language segments
+    text_segments = re.findall(r'[\w\s一-鿿]{80,}', visible_text)
+    print(f"[DEBUG-gemini] Visible text segments (>80 chars): {len(text_segments)}")
+    for i, seg in enumerate(text_segments[:5]):
+        print(f"[DEBUG-gemini]   seg[{i}]: {seg[:200]}...")
+
+    # Step 1: Find all AF_initDataCallback blocks — try multiple regex variants
+    cb_starts = []
+    for pattern in [
+        r'AF_initDataCallback\s*\(\s*\{',
+        r'AF_initDataCallback\s*\(',
+        r'AF_initDataChunkQueue\.push\s*\(',
+    ]:
+        for m in re.finditer(pattern, html):
+            cb_starts.append((m.start(), m.end(), pattern))
+    # Deduplicate by start position
+    seen = set()
+    unique = []
+    for s, e, p in cb_starts:
+        if s not in seen:
+            seen.add(s)
+            unique.append((s, e, p))
+    cb_starts = unique
+    print(f"[link_importer]   Gemini: found {len(cb_starts)} data blocks")
+    for s, e, p in cb_starts:
+        ctx = html[s:min(s+200, len(html))]
+        print(f"[DEBUG-gemini]   block '{p}' at {s}: ...{ctx}...")
+
+    for block_start, data_start, block_pattern in cb_starts:
         # Step 2: Find the data array using bracket counting from the data key
-        data_key_match = re.search(r'data\s*:\s*(?:function\s*\(\s*\)\s*\{?\s*return\s*)?', html[data_start:])
-        if not data_key_match:
-            continue
-        arr_start = data_start + data_key_match.end()
-        if arr_start >= len(html) or html[arr_start] != '[':
+        # For AF_initDataChunkQueue.push([...]), search for the array directly
+        if 'push' in block_pattern:
+            data_key_match = re.search(r'push\s*\(', html[data_start-10:data_start+10])
+            if data_key_match:
+                arr_start = data_start + 1  # skip past the '(' after 'push'
+            else:
+                arr_start = data_start
+        else:
+            data_key_match = re.search(r'data\s*:\s*(?:function\s*\(\s*\)\s*\{?\s*return\s*)?', html[data_start:])
+            if not data_key_match:
+                continue
+            arr_start = data_start + data_key_match.end()
+        if arr_start >= len(html) or html[arr_start] not in '[{':
             continue
 
         # Step 3: Bracket counting to find the matching closing bracket
@@ -721,12 +1006,47 @@ def _extract_gemini(html: str) -> Optional[dict]:
             except Exception:
                 continue
 
-    # Strategy 2: Generic approach — extract conversation-like strings from HTML
-    print(f"[link_importer]   Gemini fallback: generic string extraction")
+    # Strategy 1.5: Search all <script> tags for conversation-like JSON data
+    print(f"[link_importer]   Gemini Strategy 1.5: searching script tags for JSON")
+    script_matches = list(re.finditer(r'<script[^>]*>([\s\S]*?)</script>', html))
+    print(f"[link_importer]   Found {len(script_matches)} script tags")
+    for si, sm in enumerate(script_matches):
+        script_content = sm.group(1).strip()
+        if len(script_content) < 500:
+            continue
+        # Try to find JSON objects/arrays that look like conversation data
+        for json_pattern in [
+            r'\{["\'](?:messages|conversation|chat|contents|parts|role)',
+            r'\[["\'](?:user|model|human|assistant)',
+            r'\[\[.+?\]\]',
+        ]:
+            if re.search(json_pattern, script_content, re.IGNORECASE):
+                print(f"[link_importer]   Script tag {si}: len={len(script_content)}, found pattern: {json_pattern}")
+                # Try to extract the JSON data
+                result = _try_extract_json_from_text(script_content)
+                if result:
+                    print(f"[link_importer]   Script tag {si}: extraction succeeded!")
+                    return result
+                break
+
+    # Strategy 2: Extract visible conversation text from HTML
+    print(f"[link_importer]   Gemini Strategy 2: visible text extraction")
+    result = _extract_gemini_visible_text(html)
+    if result:
+        return result
+
+    # Strategy 2b: Visible HTML extraction (prefix-based)
+    print(f"[link_importer]   Gemini Strategy 2b: visible HTML extraction")
+    result = _extract_from_visible_html(html, "gemini")
+    if result:
+        return result
+
+    # Strategy 3: Generic approach — extract conversation-like strings from HTML (last resort)
+    print(f"[link_importer]   Gemini Strategy 3: generic string extraction")
     all_strings = re.findall(r'"([^"]{60,})"', html)
     candidates = []
     for s in all_strings:
-        decoded = s.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\').replace('\\/', '/')
+        decoded = _unescape_content(s)
         if _is_metadata(decoded) or _is_gemini_suggestion(decoded):
             continue
         candidates.append(decoded)
@@ -734,14 +1054,17 @@ def _extract_gemini(html: str) -> Optional[dict]:
     print(f"[link_importer]   Gemini candidate messages: {len(candidates)}")
     if candidates:
         messages = []
+        roles = _extract_gemini_roles_from_strings(all_strings)
         for i, text in enumerate(candidates):
-            role = "user" if i % 2 == 0 else "assistant"
+            if roles and i < len(roles):
+                role = roles[i]
+            else:
+                role = "user" if i % 2 == 0 else "assistant"
             messages.append((role, text))
         if messages:
             return {"title": "", "raw_text": _format_messages(messages, "gemini")}
 
-    # Strategy 3: visible HTML fallback
-    return _extract_from_visible_html(html, "gemini")
+    return None
 
 
 def _extract_from_gemini_data(data) -> Optional[dict]:
@@ -785,31 +1108,61 @@ def _extract_from_gemini_data(data) -> Optional[dict]:
 
     messages = []
     roles = _extract_gemini_roles_from_strings(all_strings)
-    if roles:
-        print(f"[link_importer]   Gemini detected roles: {roles}")
 
     for i, text in enumerate(candidates):
         if text.startswith('##') and ('Prompt' in text or 'System' in text):
             title = text.split('\n')[0].replace('## ', '')[:50]
             continue
-        role = "user" if i % 2 == 0 else "assistant"
-        messages.append((role, text))
+        # Determine role: use detected roles if available, else fall back to alternating
+        if roles and i < len(roles):
+            role = roles[i]
+        else:
+            role = "user" if i % 2 == 0 else "assistant"
+        messages.append((role, _unescape_content(text)))
 
     if messages:
-        raw_text = _format_messages(messages, "gemini")
+        # Merge consecutive same-role messages
+        merged = []
+        for role, content in messages:
+            if merged and merged[-1][0] == role:
+                merged[-1] = (role, merged[-1][1] + "\n\n" + content)
+            else:
+                merged.append((role, content))
+        raw_text = _format_messages(merged, "gemini")
         return {"title": title, "raw_text": raw_text}
 
     return None
 
 
 def _extract_gemini_roles_from_strings(strings):
-    """Try to find role indicators in Gemini data strings."""
+    """Try to find role indicators in Gemini data strings.
+
+    Returns list of ('user'|'assistant') matching each string's detected role,
+    or empty list if roles cannot be determined.
+    """
     roles = []
     for s in strings:
         s_lower = s.lower()
         if s in ('user', 'human', 'model', 'assistant', 'gemini', 'bot'):
             roles.append('user' if s_lower in ('user', 'human') else 'assistant')
     return roles
+
+
+def _unescape_content(text: str) -> str:
+    """Decode JSON/JS escape sequences: \\uXXXX, \\n, \\t, \\\", \\\\, etc."""
+    if not isinstance(text, str):
+        return str(text)
+    # Use JSON decode for full escape handling (handles \\uXXXX, \\n, \\\", etc.)
+    try:
+        return json.loads(f'"{text}"')
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Fallback: regex-based unicode escape + common escapes
+    result = text
+    result = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), result)
+    result = result.replace('\\n', '\n').replace('\\t', '\t')
+    result = result.replace('\\"', '"').replace('\\\\', '\\').replace('\\/', '/')
+    return result
 
 
 def _find_gemini_messages(data, depth=0):
@@ -835,7 +1188,13 @@ def _find_gemini_messages(data, depth=0):
                 if not isinstance(msg, dict):
                     continue
                 role = msg.get("role", msg.get("author", ""))
-                role = "user" if str(role).lower() in ("user", "human", "0") else "assistant"
+                role_str = str(role).lower()
+                if role_str in ("user", "human", "0"):
+                    role = "user"
+                elif role_str in ("system",):
+                    role = "system"
+                else:
+                    role = "assistant"
                 # Handle multiple content formats:
                 # 1. {"content": "text"} or {"text": "text"}
                 # 2. {"content": ["part1", "part2"]}
@@ -851,23 +1210,31 @@ def _find_gemini_messages(data, depth=0):
                     parts = []
                     for p in content:
                         if isinstance(p, dict):
-                            parts.append(p.get("text", str(p)))
+                            part_text = p.get("text", str(p))
+                            parts.append(_unescape_content(part_text))
                         else:
-                            parts.append(str(p))
+                            parts.append(_unescape_content(str(p)))
                     content = "\n".join(parts)
                 if content and str(content).strip():
-                    messages.append((role, str(content)))
+                    messages.append((role, _unescape_content(str(content))))
             if messages:
-                return messages
+                # Merge consecutive same-role messages (e.g., thinking + response)
+                merged = []
+                for role, content in messages:
+                    if merged and merged[-1][0] == role:
+                        merged[-1] = (role, merged[-1][1] + "\n\n" + content)
+                    else:
+                        merged.append((role, content))
+                return merged
         # Also handle Gemini's nested string arrays: [[["user text", "model text", ...], ...]]
         # These are arrays of strings where even indices are user, odd are model
         all_strings_in_list = all(isinstance(item, str) for item in data)
         if all_strings_in_list and len(data) >= 2:
             messages = []
             for i, text in enumerate(data):
-                if len(text) > 20 and not _is_gemini_suggestion(text):
+                if len(text) > 10 and not _is_gemini_suggestion(text):
                     role = "user" if i % 2 == 0 else "assistant"
-                    messages.append((role, text))
+                    messages.append((role, _unescape_content(text)))
             if messages:
                 return messages
     if isinstance(data, dict):
