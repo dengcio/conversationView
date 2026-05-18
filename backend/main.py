@@ -3,6 +3,9 @@ AI Conversation Import & Analysis Tool - Backend API v2.0
 FastAPI application for importing AI conversations and DeepSeek-powered analysis.
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from pathlib import Path
 from contextlib import asynccontextmanager
 

@@ -4,7 +4,9 @@ import re
 import httpx
 from typing import List, Dict
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-92f66ddef16e4673be0306c2a5f4a95d")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+if not DEEPSEEK_API_KEY:
+    raise RuntimeError("未配置 DEEPSEEK_API_KEY 环境变量，请在 .env 文件中设置")
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
