@@ -3,36 +3,93 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI 对话历史查看器</title>
+    <title>AI 对话整理工具</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div id="app">
         <header>
-            <h1>🤖 AI 对话历史查看器</h1>
-            <div class="search-box">
-                <input type="text" id="search-input" placeholder="搜索对话内容..." />
-                <button onclick="searchConversations()">搜索</button>
-            </div>
+            <h1>AI 对话整理工具</h1>
+            <button class="btn-primary" onclick="openImportModal()">+ 导入对话</button>
         </header>
 
         <main>
-            <div class="sidebar">
-                <h2>对话会话</h2>
-                <div id="session-list"></div>
-            </div>
+            <aside id="sidebar">
+                <div id="sidebar-header">
+                    <h2>对话列表</h2>
+                    <span id="conv-count"></span>
+                </div>
+                <div id="conversation-list"></div>
+            </aside>
 
-            <div class="content">
+            <section id="content">
                 <div id="conversation-view">
-                    <p class="placeholder">选择一个会话查看对话内容</p>
+                    <p class="placeholder">选择一个对话查看内容</p>
+                </div>
+            </section>
+        </main>
+
+        <!-- Import Modal -->
+        <div id="import-overlay" class="modal-overlay" style="display:none">
+            <div class="modal modal-wide">
+                <h2>导入 AI 对话</h2>
+
+                <!-- Import mode tabs -->
+                <div class="import-tabs">
+                    <button class="import-tab active" onclick="switchImportMode('text')">粘贴文本</button>
+                    <button class="import-tab" onclick="switchImportMode('link')">分享链接</button>
                 </div>
 
-                <div id="chunk-panel" style="display: none;">
-                    <h3>保存的分块</h3>
-                    <div id="chunk-list"></div>
+                <!-- Text import panel -->
+                <div id="import-panel-text">
+                    <div class="form-group">
+                        <label>来源</label>
+                        <select id="import-source">
+                            <option value="chatgpt">ChatGPT</option>
+                            <option value="claude">Claude</option>
+                            <option value="deepseek">DeepSeek</option>
+                            <option value="gemini">Gemini</option>
+                            <option value="generic">通用格式</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>标题（可选）</label>
+                        <input type="text" id="import-title" placeholder="留空则自动生成">
+                    </div>
+                    <div class="form-group">
+                        <label>对话内容</label>
+                        <textarea id="import-text" rows="12" placeholder="在此粘贴对话内容..."></textarea>
+                    </div>
+                </div>
+
+                <!-- Link import panel -->
+                <div id="import-panel-link" style="display:none">
+                    <div class="form-group">
+                        <label>分享链接</label>
+                        <input type="url" id="import-link" placeholder="https://chatgpt.com/share/... 或 https://claude.ai/share/...">
+                    </div>
+                    <div class="form-group">
+                        <label>标题（可选，留空自动获取）</label>
+                        <input type="text" id="import-link-title" placeholder="留空则自动获取">
+                    </div>
+                    <p class="form-hint">支持 ChatGPT、Claude、DeepSeek 的公开分享链接。链接需可公开访问。</p>
+                </div>
+
+                <div class="modal-actions">
+                    <button class="btn-secondary" onclick="closeImportModal()">取消</button>
+                    <button class="btn-primary" id="btn-import" onclick="handleImport(false)">导入</button>
+                    <button class="btn-primary" id="btn-import-analyze" onclick="handleImport(true)">导入并分析</button>
                 </div>
             </div>
-        </main>
+        </div>
+
+        <!-- Loading overlay -->
+        <div id="loading-overlay" class="loading-overlay" style="display:none">
+            <div class="loading-spinner">
+                <div class="spinner"></div>
+                <p id="loading-text">分析中...</p>
+            </div>
+        </div>
     </div>
 
     <script src="app.js"></script>

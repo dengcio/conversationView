@@ -1,333 +1,265 @@
 """
-OpenClaw Conversation Viewer - Backend API
-FastAPI application that interfaces with OpenClaw Gateway API
+AI Conversation Import & Analysis Tool - Backend API v2.0
+FastAPI application for importing AI conversations and DeepSeek-powered analysis.
 """
+
+from pathlib import Path
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
-import httpx
-import sqlite3
-import json
-from datetime import datetime
+from fastapi.staticfiles import StaticFiles
+import uvicorn
 
-app = FastAPI(title="Conversation Viewer API", version="1.0.0")
+from database import (
+    init_db,
+    create_conversation,
+    get_all_conversations,
+    get_conversation,
+    get_conversation_full,
+    update_conversation,
+    delete_conversation,
+    insert_messages,
+    get_messages,
+    get_analysis_chunks,
+    save_analysis_chunks,
+)
+from conv_parser import parse_conversation
+from link_importer import import_from_link
+from analyzer import analyze_conversation
+from models import (
+    ImportRequest,
+    ImportResponse,
+    LinkImportRequest,
+    AnalyzeRequest,
+    ConversationListItem,
+    ConversationDetail,
+    MessageResponse,
+    AnalysisChunkResponse,
+)
 
-# CORS configuration for frontend
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="AI对话导入与分析工具", version="2.0.0", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# OpenClaw Gateway configuration
-OPENCLAW_GATEWAY_URL = "http://127.0.0.1:28789"
-OPENCLAW_GATEWAY_TOKEN = "qclaw_3c7790d3218d9501a8bdba76e44f6f1a021b57f4153c9dcf0dd26ca05580417"
 
-# SQLite database setup
-DB_PATH = "conversations.db"
+# ============================================
+# Phase 1: Import + View
+# ============================================
 
-
-def init_db():
-    """Initialize SQLite database for storing user annotations"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_key TEXT NOT NULL,
-            message_id TEXT,
-            content TEXT NOT NULL,
-            role TEXT NOT NULL,
-            timestamp TEXT,
-            tags TEXT,  -- JSON array
-            notes TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+@app.post("/api/import", response_model=ImportResponse)
+async def import_conversation(request: ImportRequest):
+    parsed = parse_conversation(request.raw_text, request.source)
+    if not parsed:
+        raise HTTPException(
+            status_code=422,
+            detail="无法识别对话格式。请确认来源选择正确，或尝试手动添加角色标注。"
         )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bookmarks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_key TEXT NOT NULL,
-            message_id TEXT,
-            title TEXT,
-            note TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+
+    title = request.title or "未命名对话"
+    conv_id = create_conversation(title, request.source)
+    insert_messages(conv_id, parsed)
+
+    messages = get_messages(conv_id)
+    preview = messages[:5]
+    conv = get_conversation(conv_id)
+
+    return ImportResponse(
+        conversation_id=conv_id,
+        title=conv["title"],
+        message_count=conv["message_count"],
+        parsed_preview=[
+            MessageResponse(id=m["id"], seq_order=m["seq_order"], role=m["role"], content=m["content"])
+            for m in preview
+        ]
+    )
+
+
+@app.post("/api/import-from-link", response_model=ImportResponse)
+async def import_from_link_endpoint(request: LinkImportRequest):
+    try:
+        result = await import_from_link(request.url)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取链接内容失败: {str(e)}")
+
+    parsed = parse_conversation(result["raw_text"], result["source"])
+    if not parsed:
+        raise HTTPException(
+            status_code=422,
+            detail="成功获取链接内容但无法识别对话格式。已保存原始文本，请尝试手动导入。"
         )
-    """)
-    conn.commit()
-    conn.close()
+
+    title = request.title or result.get("title") or "未命名对话"
+    conv_id = create_conversation(title, result["source"])
+    insert_messages(conv_id, parsed)
+
+    messages = get_messages(conv_id)
+    preview = messages[:5]
+    conv = get_conversation(conv_id)
+
+    return ImportResponse(
+        conversation_id=conv_id,
+        title=conv["title"],
+        message_count=conv["message_count"],
+        parsed_preview=[
+            MessageResponse(id=m["id"], seq_order=m["seq_order"], role=m["role"], content=m["content"])
+            for m in preview
+        ]
+    )
 
 
-init_db()
+@app.get("/api/conversations", response_model=list[ConversationListItem])
+async def list_conversations():
+    convs = get_all_conversations()
+    return [
+        ConversationListItem(
+            id=c["id"],
+            title=c["title"],
+            source=c["source"],
+            message_count=c["message_count"],
+            is_analyzed=bool(c["is_analyzed"]),
+            created_at=c["created_at"],
+        )
+        for c in convs
+    ]
 
 
-# Pydantic models
-class SessionResponse(BaseModel):
-    sessionKey: str
-    kind: Optional[str]
-    lastActivity: Optional[str]
-    messageCount: Optional[int]
+@app.get("/api/conversations/{conv_id}", response_model=ConversationDetail)
+async def get_conversation_detail(conv_id: int):
+    conv = get_conversation_full(conv_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
 
-
-class ConversationChunk(BaseModel):
-    id: Optional[int] = None
-    session_key: str
-    message_id: Optional[str] = None
-    content: str
-    role: str
-    timestamp: Optional[str] = None
-    tags: List[str] = []
-    notes: Optional[str] = None
-
-
-class Bookmark(BaseModel):
-    id: Optional[int] = None
-    session_key: str
-    message_id: Optional[str] = None
-    title: str
-    note: Optional[str] = None
-
-
-@app.get("/")
-async def root():
-    return {"message": "Conversation Viewer API is running"}
-
-
-@app.get("/api/sessions", response_model=List[SessionResponse])
-async def list_sessions(
-    kinds: Optional[List[str]] = None,
-    active_minutes: Optional[int] = None,
-    limit: int = 50,
-    message_limit: int = 10
-):
-    """
-    List all conversation sessions from OpenClaw
-    """
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{OPENCLAW_GATEWAY_URL}/api/tools/call",
-                headers={
-                    "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "tool": "sessions_list",
-                    "parameters": {
-                        "kinds": kinds,
-                        "activeMinutes": active_minutes,
-                        "limit": limit,
-                        "messageLimit": message_limit
-                    }
-                },
-                timeout=30.0
+    return ConversationDetail(
+        id=conv["id"],
+        title=conv["title"],
+        source=conv["source"],
+        message_count=conv["message_count"],
+        is_analyzed=conv["is_analyzed"],
+        created_at=conv["created_at"],
+        messages=[
+            MessageResponse(id=m["id"], seq_order=m["seq_order"], role=m["role"], content=m["content"])
+            for m in conv.get("messages", [])
+        ],
+        analysis=[
+            AnalysisChunkResponse(
+                id=a["id"],
+                chunk_index=a["chunk_index"],
+                title=a.get("title"),
+                summary=a.get("summary"),
+                start_msg_id=a.get("start_msg_id"),
+                end_msg_id=a.get("end_msg_id"),
+                keywords=a.get("keywords", []),
+                value_score=a.get("value_score", 0),
+                tags=a.get("tags", []),
+                created_at=a["created_at"],
             )
-
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
-
-            result = response.json()
-            return result.get("result", [])
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            for a in conv.get("analysis", [])
+        ] if conv.get("analysis") else None,
+    )
 
 
-@app.get("/api/sessions/{session_key}/history")
-async def get_session_history(session_key: str, limit: int = 100, include_tools: bool = False):
-    """
-    Get conversation history for a specific session
-    """
+@app.delete("/api/conversations/{conv_id}")
+async def delete_conversation_endpoint(conv_id: int):
+    conv = get_conversation(conv_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    delete_conversation(conv_id)
+    return {"message": "对话已删除", "conversation_id": conv_id}
+
+
+# ============================================
+# Phase 2: AI Analysis
+# ============================================
+
+@app.post("/api/conversations/{conv_id}/analyze")
+async def analyze_conversation_endpoint(conv_id: int, request: AnalyzeRequest = None):
+    conv = get_conversation(conv_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    messages = get_messages(conv_id)
+    if not messages:
+        raise HTTPException(status_code=400, detail="对话没有消息，无法分析")
+
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{OPENCLAW_GATEWAY_URL}/api/tools/call",
-                headers={
-                    "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "tool": "sessions_history",
-                    "parameters": {
-                        "sessionKey": session_key,
-                        "limit": limit,
-                        "includeTools": include_tools
-                    }
-                },
-                timeout=30.0
-            )
-
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
-
-            result = response.json()
-            return result.get("result", {})
-
-    except Exception as e:
+        analysis_result = await analyze_conversation(messages)
+    except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/search")
-async def search_conversations(query: str, limit: int = 20):
-    """
-    Search across conversation history using memory_search
-    """
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{OPENCLAW_GATEWAY_URL}/api/tools/call",
-                headers={
-                    "Authorization": f"Bearer {OPENCLAW_GATEWAY_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "tool": "memory_search",
-                    "parameters": {
-                        "query": query,
-                        "maxResults": limit,
-                        "corpus": "memory"
-                    }
-                },
-                timeout=30.0
-            )
-
-            if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
-
-            result = response.json()
-            return result.get("result", {})
-
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"分析失败: {str(e)}")
 
+    chunks = analysis_result.get("chunks", [])
+    overall_title = analysis_result.get("overall_title")
 
-# Chunk management endpoints
-@app.post("/api/chunks")
-async def create_chunk(chunk: ConversationChunk):
-    """
-    Save a conversation chunk with tags and notes
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO chunks (session_key, message_id, content, role, timestamp, tags, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        chunk.session_key,
-        chunk.message_id,
-        chunk.content,
-        chunk.role,
-        chunk.timestamp,
-        json.dumps(chunk.tags),
-        chunk.notes
-    ))
-    conn.commit()
-    chunk_id = cursor.lastrowid
-    conn.close()
-    return {"message": "Chunk saved", "chunk_id": chunk_id}
-
-
-@app.get("/api/chunks")
-async def get_chunks(session_key: Optional[str] = None, tag: Optional[str] = None):
-    """
-    Get all saved chunks, optionally filtered by session or tag
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    if session_key:
-        cursor.execute("SELECT * FROM chunks WHERE session_key = ? ORDER BY created_at DESC", (session_key,))
-    else:
-        cursor.execute("SELECT * FROM chunks ORDER BY created_at DESC")
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    chunks = []
-    for row in rows:
-        tags = json.loads(row[6]) if row[6] else []
-        if tag and tag not in tags:
-            continue
-        chunks.append({
-            "id": row[0],
-            "session_key": row[1],
-            "message_id": row[2],
-            "content": row[3],
-            "role": row[4],
-            "timestamp": row[5],
-            "tags": tags,
-            "notes": row[7],
-            "created_at": row[8]
+    chunk_records = []
+    for c in chunks:
+        chunk_records.append({
+            "chunk_index": len(chunk_records) + 1,
+            "title": c.get("title", ""),
+            "summary": c.get("summary", ""),
+            "start_msg_id": None,
+            "end_msg_id": None,
+            "keywords": c.get("keywords", []),
+            "value_score": c.get("value_score", 3),
+            "tags": c.get("tags", []),
         })
 
-    return chunks
+    save_analysis_chunks(conv_id, chunk_records)
+    update_conversation(conv_id, is_analyzed=True)
+
+    if overall_title and conv["title"] == "未命名对话":
+        update_conversation(conv_id, title=overall_title)
+
+    return {
+        "conversation_id": conv_id,
+        "chunks": [
+            {
+                "chunk_index": c["chunk_index"],
+                "title": c["title"],
+                "summary": c["summary"],
+                "keywords": c["keywords"],
+                "value_score": c["value_score"],
+                "tags": c["tags"],
+                "message_range": {"start": c.get("start_msg_id"), "end": c.get("end_msg_id")},
+            }
+            for c in chunk_records
+        ]
+    }
 
 
-@app.delete("/api/chunks/{chunk_id}")
-async def delete_chunk(chunk_id: int):
-    """
-    Delete a chunk by ID
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
-    conn.commit()
-    conn.close()
-    return {"message": "Chunk deleted"}
+@app.get("/api/conversations/{conv_id}/analysis")
+async def get_analysis(conv_id: int):
+    conv = get_conversation(conv_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    chunks = get_analysis_chunks(conv_id)
+    return {
+        "conversation_id": conv_id,
+        "chunks": chunks,
+    }
 
 
-# Bookmark management endpoints
-@app.post("/api/bookmarks")
-async def create_bookmark(bookmark: Bookmark):
-    """
-    Save a bookmark
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO bookmarks (session_key, message_id, title, note)
-        VALUES (?, ?, ?, ?)
-    """, (bookmark.session_key, bookmark.message_id, bookmark.title, bookmark.note))
-    conn.commit()
-    bookmark_id = cursor.lastrowid
-    conn.close()
-    return {"message": "Bookmark saved", "bookmark_id": bookmark_id}
-
-
-@app.get("/api/bookmarks")
-async def get_bookmarks(session_key: Optional[str] = None):
-    """
-    Get all bookmarks, optionally filtered by session
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    if session_key:
-        cursor.execute("SELECT * FROM bookmarks WHERE session_key = ? ORDER BY created_at DESC", (session_key,))
-    else:
-        cursor.execute("SELECT * FROM bookmarks ORDER BY created_at DESC")
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    bookmarks = []
-    for row in rows:
-        bookmarks.append({
-            "id": row[0],
-            "session_key": row[1],
-            "message_id": row[2],
-            "title": row[3],
-            "note": row[4],
-            "created_at": row[5]
-        })
-
-    return bookmarks
+# Mount frontend at root — must be AFTER all API routes
+frontend_dir = str(Path(__file__).resolve().parent.parent / "frontend")
+app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
 
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -115,6 +115,12 @@ dmypy.json
 .vscode/
 .idea/
 
+# Agent skills
+.agents/
+.claude/
+CLAUDE.md
+skills-lock.json
+
 # OS
 .DS_Store
 Thumbs.db
